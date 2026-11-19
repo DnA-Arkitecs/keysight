@@ -1,0 +1,266 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>KeySight HUD</title>
+<style>
+  :root { --cy: #00e5ff; --dim: #0b3a44; --red: #ff2a4d; }
+  html, body { margin: 0; height: 100%; background: #02060a; color: var(--cy); font-family: Consolas, "Courier New", monospace; overflow: hidden; }
+  #stage { position: absolute; inset: 0; display: flex; align-items: center; justify-content: center; }
+  #c { max-width: 100%; max-height: 100%; background: #000; box-shadow: 0 0 40px #00e5ff33; }
+  .panel { position: absolute; background: #02141acc; border: 1px solid #0f6a78; padding: 10px 14px; text-shadow: 0 0 6px #00e5ff88; }
+  #stats { top: 12px; left: 12px; min-width: 230px; font-size: 14px; line-height: 1.55; }
+  #stats b { font-size: 22px; color: #fff; }
+  #purity { font-size: 34px !important; }
+  #controls { top: 12px; right: 12px; display: flex; flex-direction: column; gap: 6px; }
+  button { background: #062a33; color: var(--cy); border: 1px solid #1fb6c9; padding: 8px 12px; font: inherit; cursor: pointer; }
+  button:hover { background: #0a4452; }
+  #alert { position: absolute; top: 14px; left: 50%; transform: translateX(-50%); padding: 10px 26px; font-size: 22px; font-weight: bold;
+           color: #fff; background: #5a0010dd; border: 2px solid var(--red); text-shadow: 0 0 10px var(--red); display: none; letter-spacing: 1px; }
+  #alert.on { display: block; animation: pulse .5s infinite alternate; }
+  @keyframes pulse { from { box-shadow: 0 0 6px var(--red); } to { box-shadow: 0 0 28px var(--red); } }
+  #inset { right: 12px; bottom: 12px; padding: 4px; }
+  #inset div { font-size: 11px; opacity: .8; padding: 2px 6px; }
+  #hint { left: 12px; bottom: 12px; font-size: 12px; opacity: .85; max-width: 360px; }
+</style>
+</head>
+<body>
+<div id="stage"><canvas id="c" width="960" height="540"></canvas></div>
+
+<div id="alert"></div>
+
+<div class="panel" id="stats">
+  <div>KEYSIGHT // HUD</div>
+  <div>MODEL <span id="model">LOADING...</span></div>
+  <div>FPS <b id="fps">0</b> &nbsp; CAM <span id="camfps">0</span>/s</div>
+  <div>JOINTS <span id="joints">0</span>/42</div>
+  <div>10-FINGER PURITY</div>
+  <div><b id="purity">100.0%</b></div>
+  <div>SOURCE <span id="srcname">PHONE CAM</span> (<span id="phone">no phone yet</span>)</div>
+</div>
+
+<div class="panel" id="controls">
+  <button id="btnSource">Use PC webcam</button>
+  <button id="btnSwap">Swap L/R labels: ON</button>
+  <button id="btnReset">Reset purity</button>
+</div>
+
+<div class="panel" id="inset"><canvas id="d" width="260" height="190"></canvas><div>3D VIEW (spins)</div></div>
+<div class="panel" id="hint">Waiting for frames. On your phone scan the QR code from the PowerShell window, or click "Use PC webcam".</div>
+
+<script type="module">
+import { FilesetResolver, HandLandmarker } from "/static/vendor/vision_bundle.mjs";
+
+// https page (LAN or tunnel) -> wss; plain http://localhost (tunnel mode, on the PC) -> ws
+const WS_SCHEME = location.protocol === "https:" ? "wss:" : "ws:";
+const $ = id => document.getElementById(id);
+const canvas = $("c"), ctx = canvas.getContext("2d");
+const inset = $("d"), ictx = inset.getContext("2d");
+
+// MediaPipe's 21 landmarks: 0 wrist, 1-4 thumb, 5-8 index, 9-12 middle, 13-16 ring, 17-20 pinky.
+const BONES = [[0,1],[1,2],[2,3],[3,4],[0,5],[5,6],[6,7],[7,8],[5,9],[9,10],[10,11],[11,12],
+               [9,13],[13,14],[14,15],[15,16],[13,17],[17,18],[18,19],[19,20],[0,17]];
+const FINGERS = [
+  { name: "Thumb",  tip: 4,  color: "#ff9f43", joints: [1,2,3,4] },
+  { name: "Index",  tip: 8,  color: "#00e5ff", joints: [5,6,7,8] },
+  { name: "Middle", tip: 12, color: "#48ff9b", joints: [9,10,11,12] },
+  { name: "Ring",   tip: 16, color: "#c77dff", joints: [13,14,15,16] },
+  { name: "Pinky",  tip: 20, color: "#ff5d9e", joints: [17,18,19,20] },
+];
+const fingerOf = i => FINGERS.find(f => f.joints.includes(i));
+
+let landmarker = null, delegate = "", swapLR = true, source = "phone";
+let ws = null, inflight = 0, lastResults = [], lastSteal = 0, stealText = "";
+let frames = 0, camFrames = 0, lastTick = performance.now(), lastTs = 0, worldHands = [];
+let webcamStream = null;
+const webcam = document.createElement("video");
+webcam.playsInline = true; webcam.muted = true;
+
+// ---------- model ----------
+async function loadModel() {
+  const fileset = await FilesetResolver.forVisionTasks("/static/vendor/wasm");
+  const make = d => HandLandmarker.createFromOptions(fileset, {
+    baseOptions: { modelAssetPath: "/static/vendor/hand_landmarker.task", delegate: d },
+    runningMode: "VIDEO", numHands: 2,
+  });
+  try { landmarker = await make("GPU"); delegate = "GPU"; }
+  catch (e) { console.warn("GPU unavailable, using CPU", e); landmarker = await make("CPU"); delegate = "CPU"; }
+  $("model").textContent = `READY (${delegate})`;
+  window.__keysight = { ready: true, delegate };
+}
+
+// ---------- websocket to Python ----------
+function connect() {
+  ws = new WebSocket(`${WS_SCHEME}//${location.host}/ws/hud`);
+  ws.binaryType = "arraybuffer";
+  ws.onmessage = onMessage;
+  ws.onclose = () => { inflight = 0; setTimeout(connect, 1000); };
+}
+
+let busy = false, pending = null;
+async function onMessage(e) {
+  if (typeof e.data === "string") {
+    const m = JSON.parse(e.data);
+    if (m.type === "status") $("phone").textContent = m.cams ? "phone connected" : "no phone yet";
+    if (m.type === "rep1") {
+      inflight = Math.max(0, inflight - 1);
+      lastResults = m.results;
+      $("purity").textContent = m.purity.toFixed(1) + "%";
+      const t = m.results.find(r => r.steal);
+      if (t) { lastSteal = performance.now(); stealText = `${t.label.toUpperCase()} ${t.thief_finger.toUpperCase()} STOLE A KEY (${t.zone.toUpperCase()} ZONE)`; }
+    }
+    if (m.type === "error") { inflight = Math.max(0, inflight - 1); console.warn("rep1:", m.message); }
+    return;
+  }
+  camFrames++;
+  if (source !== "phone") return;
+  if (busy) { pending = e.data; return; }   // keep only the newest frame
+  busy = true;
+  let data = e.data;
+  while (data) {
+    const bmp = await createImageBitmap(new Blob([data], { type: "image/jpeg" }));
+    try { process(bmp, bmp.width, bmp.height); } catch (err) { console.error(err); }
+    bmp.close();
+    data = pending; pending = null;
+  }
+  busy = false;
+}
+
+// ---------- one frame: detect, draw, ask Python ----------
+function process(img, w, h) {
+  if (!landmarker) return;
+  lastTs = Math.max(performance.now(), lastTs + 1);
+  const res = landmarker.detectForVideo(img, lastTs);
+  frames++;
+
+  if (canvas.width !== w || canvas.height !== h) { canvas.width = w; canvas.height = h; }
+  ctx.drawImage(img, 0, 0, w, h);
+  ctx.fillStyle = "#001018aa"; ctx.fillRect(0, 0, w, h);   // darken video so the HUD pops
+  drawGrid(w, h);
+
+  const hands = res.landmarks.map((lm, i) => {
+    const mp = res.handedness[i][0].categoryName;
+    const label = swapLR ? (mp === "Left" ? "Right" : "Left") : mp;   // MediaPipe assumes a mirrored selfie image
+    return { label, lm, score: res.handedness[i][0].score };
+  });
+  worldHands = res.worldLandmarks;
+  $("joints").textContent = hands.length * 21;
+  $("hint").style.display = hands.length ? "none" : "block";
+  if (!hands.length) lastResults = [];
+
+  hands.forEach((hand, i) => drawHand(hand, lastResults[i] && lastResults[i].label === hand.label ? lastResults[i] : null, w, h));
+
+  if (hands.length && ws && ws.readyState === 1 && inflight < 3) {
+    inflight++;
+    ws.send(JSON.stringify({ type: "hands", hands: hands.map(x => ({ label: x.label, landmarks: x.lm.map(p => [p.x, p.y, p.z]) })) }));
+  }
+  const alertOn = performance.now() - lastSteal < 400;
+  $("alert").className = alertOn ? "on" : "";
+  $("alert").textContent = alertOn ? "FINGER-STEAL ALERT // " + stealText : "";
+  drawInset();
+}
+
+function drawGrid(w, h) {
+  ctx.strokeStyle = "#00e5ff14"; ctx.lineWidth = 1;
+  for (let x = 0; x < w; x += 48) { ctx.beginPath(); ctx.moveTo(x, 0); ctx.lineTo(x, h); ctx.stroke(); }
+  for (let y = 0; y < h; y += 48) { ctx.beginPath(); ctx.moveTo(0, y); ctx.lineTo(w, y); ctx.stroke(); }
+  ctx.strokeStyle = "#00e5ff"; ctx.lineWidth = 2; const c = 26, m = 8;
+  [[m, m, 1, 1], [w - m, m, -1, 1], [m, h - m, 1, -1], [w - m, h - m, -1, -1]].forEach(([x, y, sx, sy]) => {
+    ctx.beginPath(); ctx.moveTo(x, y + sy * c); ctx.lineTo(x, y); ctx.lineTo(x + sx * c, y); ctx.stroke();
+  });
+}
+
+function drawHand(hand, verdict, w, h) {
+  const s = w / 960, lm = hand.lm;
+  const P = i => [lm[i].x * w, lm[i].y * h];
+  const thief = verdict && verdict.steal ? verdict.thief_finger : null;
+  ctx.save();
+  ctx.lineCap = "round"; ctx.shadowBlur = 14 * s;
+  // glowing bones, coloured by finger (thief finger turns red)
+  for (const [a, b] of BONES) {
+    const f = fingerOf(b), isThief = f && f.name === thief;
+    ctx.strokeStyle = ctx.shadowColor = isThief ? "#ff2a4d" : (f ? f.color : "#7df9ff");
+    ctx.lineWidth = (isThief ? 5 : 3) * s;
+    ctx.beginPath(); ctx.moveTo(...P(a)); ctx.lineTo(...P(b)); ctx.stroke();
+  }
+  // joints: closer to the camera (smaller z) = bigger dot
+  lm.forEach((p, i) => {
+    const f = fingerOf(i), isThief = f && f.name === thief;
+    const r = Math.max(2.5, Math.min(10, 5 - p.z * 25)) * s;
+    ctx.fillStyle = ctx.shadowColor = isThief ? "#ff2a4d" : (f ? f.color : "#ffffff");
+    ctx.beginPath(); ctx.arc(p.x * w, p.y * h, r, 0, 7); ctx.fill();
+  });
+  ctx.shadowBlur = 0;
+  // finger badges on each tip
+  ctx.font = `bold ${Math.round(13 * s)}px Consolas, monospace`; ctx.textBaseline = "middle";
+  for (const f of FINGERS) {
+    const [x, y] = P(f.tip), isThief = f.name === thief;
+    const tw = ctx.measureText(f.name).width + 12 * s, bh = 20 * s, bx = x - tw / 2, by = y - 34 * s;
+    ctx.fillStyle = isThief ? "#ff2a4d" : "#021016e6"; ctx.strokeStyle = isThief ? "#fff" : f.color; ctx.lineWidth = 1.5 * s;
+    ctx.fillRect(bx, by, tw, bh); ctx.strokeRect(bx, by, tw, bh);
+    ctx.fillStyle = isThief ? "#fff" : f.color; ctx.textAlign = "center"; ctx.fillText(f.name, x, by + bh / 2 + 1);
+  }
+  // hand name at the wrist
+  const [wx, wy] = P(0);
+  ctx.textAlign = "center"; ctx.fillStyle = "#fff"; ctx.font = `bold ${Math.round(15 * s)}px Consolas, monospace`;
+  ctx.fillText(`${hand.label.toUpperCase()} HAND ${Math.round(hand.score * 100)}%`, wx, wy + 30 * s);
+  ctx.restore();
+}
+
+// small spinning 3D view built from MediaPipe's real-world (metres) joints
+function drawInset() {
+  ictx.clearRect(0, 0, inset.width, inset.height);
+  const a = performance.now() / 1600, ca = Math.cos(a), sa = Math.sin(a), k = 650;
+  worldHands.forEach((wl, hi) => {
+    const ox = (hi - (worldHands.length - 1) / 2) * 110 + inset.width / 2, oy = inset.height / 2;
+    const pt = p => [ox + (p.x * ca + p.z * sa) * k, oy + p.y * k];
+    ictx.strokeStyle = "#00e5ff"; ictx.lineWidth = 1.5;
+    for (const [i, j] of BONES) { ictx.beginPath(); ictx.moveTo(...pt(wl[i])); ictx.lineTo(...pt(wl[j])); ictx.stroke(); }
+    wl.forEach((p, i) => { const f = fingerOf(i); const [x, y] = pt(p); ictx.fillStyle = f ? f.color : "#fff"; ictx.fillRect(x - 2, y - 2, 4, 4); });
+  });
+}
+
+// ---------- PC webcam fallback ----------
+async function startWebcam() {
+  webcamStream = await navigator.mediaDevices.getUserMedia({ video: { width: { ideal: 1280 }, height: { ideal: 720 }, frameRate: { ideal: 60 } }, audio: false });
+  webcam.srcObject = webcamStream;
+  await webcam.play();
+  const step = () => {
+    if (source !== "webcam") return;
+    camFrames++;
+    try { process(webcam, webcam.videoWidth, webcam.videoHeight); } catch (err) { console.error(err); }
+    webcam.requestVideoFrameCallback(step);
+  };
+  webcam.requestVideoFrameCallback(step);
+}
+function stopWebcam() {
+  if (webcamStream) webcamStream.getTracks().forEach(t => t.stop());
+  webcamStream = null;
+}
+$("btnSource").onclick = async () => {
+  if (source === "phone") {
+    try { source = "webcam"; await startWebcam(); }
+    catch (e) { source = "phone"; $("hint").textContent = "Webcam blocked: " + e.message; $("hint").style.display = "block"; return; }
+    $("btnSource").textContent = "Use phone cam"; $("srcname").textContent = "PC WEBCAM";
+  } else {
+    source = "phone"; stopWebcam();
+    $("btnSource").textContent = "Use PC webcam"; $("srcname").textContent = "PHONE CAM";
+  }
+};
+$("btnSwap").onclick = () => { swapLR = !swapLR; $("btnSwap").textContent = `Swap L/R labels: ${swapLR ? "ON" : "OFF"}`; };
+$("btnReset").onclick = () => { if (ws && ws.readyState === 1) ws.send(JSON.stringify({ type: "reset" })); $("purity").textContent = "100.0%"; };
+
+// ---------- counters ----------
+setInterval(() => {
+  const now = performance.now(), dt = (now - lastTick) / 1000;
+  $("fps").textContent = Math.round(frames / dt);
+  $("camfps").textContent = Math.round(camFrames / dt);
+  frames = 0; camFrames = 0; lastTick = now;
+}, 1000);
+
+connect();
+loadModel().catch(e => { $("model").textContent = "FAILED"; console.error(e); $("hint").textContent = "Model failed to load: " + e.message; });
+</script>
+</body>
+</html>

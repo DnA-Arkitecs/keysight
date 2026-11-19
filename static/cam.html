@@ -1,0 +1,79 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>KeySight Cam</title>
+<style>
+  html, body { margin: 0; height: 100%; background: #02060a; color: #7df9ff; font-family: system-ui, sans-serif; }
+  #wrap { display: flex; flex-direction: column; height: 100%; }
+  video { flex: 1; min-height: 0; width: 100%; object-fit: contain; background: #000; }
+  #bar { padding: 10px 14px calc(10px + env(safe-area-inset-bottom)); display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
+  button { background: #062a33; color: #7df9ff; border: 1px solid #1fb6c9; border-radius: 8px; padding: 12px 16px; font-size: 16px; }
+  #msg { font-size: 14px; opacity: .85; flex-basis: 100%; }
+</style>
+</head>
+<body>
+<div id="wrap">
+  <video id="v" playsinline muted autoplay></video>
+  <div id="bar">
+    <button id="start">Start camera</button>
+    <button id="flip">Front / Back</button>
+    <span id="msg">Tap Start. Frames go to the PC running KeySight.</span>
+  </div>
+</div>
+<script>
+// https page (LAN or tunnel) -> wss; plain http -> ws
+const WS_SCHEME = location.protocol === "https:" ? "wss:" : "ws:";
+const WIDTH = 960, QUALITY = 0.7;     // frame width sent to the PC and JPEG quality
+const v = document.getElementById("v"), msg = document.getElementById("msg");
+const canvas = document.createElement("canvas"), ctx = canvas.getContext("2d");
+let facing = "environment", stream = null, ws = null, sent = 0, lastTick = performance.now();
+
+function connect() {
+  ws = new WebSocket(`${WS_SCHEME}//${location.host}/ws/cam`);
+  ws.binaryType = "arraybuffer";
+  ws.onclose = () => { msg.textContent = "Reconnecting to PC..."; setTimeout(connect, 1000); };
+}
+
+async function startCamera() {
+  if (stream) stream.getTracks().forEach(t => t.stop());
+  stream = await navigator.mediaDevices.getUserMedia({
+    video: { facingMode: facing, width: { ideal: 1280 }, height: { ideal: 720 }, frameRate: { ideal: 60 } },
+    audio: false,
+  });
+  v.srcObject = stream;
+  await v.play();
+}
+
+// Grab a frame each time the camera produces one, shrink it, send it as a JPEG.
+function pump() {
+  const next = () => ("requestVideoFrameCallback" in v ? v.requestVideoFrameCallback(pump) : requestAnimationFrame(pump));
+  if (v.videoWidth && ws && ws.readyState === 1 && ws.bufferedAmount < 500000) {
+    canvas.width = WIDTH;
+    canvas.height = Math.round(WIDTH * v.videoHeight / v.videoWidth);
+    ctx.drawImage(v, 0, 0, canvas.width, canvas.height);
+    canvas.toBlob(b => { if (b && ws.readyState === 1) { ws.send(b); sent++; } }, "image/jpeg", QUALITY);
+  }
+  const now = performance.now();
+  if (now - lastTick > 1000) {
+    msg.textContent = `Sending ${Math.round(sent * 1000 / (now - lastTick))} frames/sec to PC`;
+    sent = 0; lastTick = now;
+  }
+  next();
+}
+
+document.getElementById("start").onclick = async () => {
+  try {
+    if (!ws) connect();
+    await startCamera();
+    pump();
+  } catch (e) { msg.textContent = "Camera blocked: " + e.message; }
+};
+document.getElementById("flip").onclick = async () => {
+  facing = facing === "environment" ? "user" : "environment";
+  if (stream) await startCamera();
+};
+</script>
+</body>
+</html>
